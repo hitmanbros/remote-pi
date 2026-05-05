@@ -36,10 +36,23 @@ jobs:
           cd app
           npx expo prebuild --clean --platform android
 
+      - name: Fix Kotlin version
+        run: |
+          cd app
+          sed -i 's/kotlinCompilerExtensionVersion = versionsMap\[kotlinVersion()\]/kotlinCompilerExtensionVersion = "1.5.14"/' node_modules/expo-modules-core/android/build.gradle
+          grep "kotlinCompilerExtensionVersion" node_modules/expo-modules-core/android/build.gradle || true
+
+      - name: Enable cleartext traffic for ws:// connections
+        run: |
+          cd app/android
+          sed -i 's/<application/<application android:usesCleartextTraffic="true"/' app/src/main/AndroidManifest.xml
+          grep "usesCleartextTraffic" app/src/main/AndroidManifest.xml || true
+
       - name: Build release APK
         run: |
           cd app/android
-          ./gradlew assembleRelease
+          ./gradlew assembleRelease \
+            -Pkotlin.compiler.suppressKotlinVersionCompatibilityCheck=true
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
