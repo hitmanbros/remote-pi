@@ -3,6 +3,10 @@ name: Build Android APK
 on:
   push:
     branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -59,3 +63,26 @@ jobs:
         with:
           name: remote-pi-apk
           path: app/android/app/build/outputs/apk/release/app-release.apk
+
+      - name: Copy APK for release
+        run: |
+          mkdir -p dist
+          cp app/android/app/build/outputs/apk/release/app-release.apk dist/remote-pi.apk
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: "Latest Android Build"
+          body: |
+            Automated build of remote-pi Android APK.
+
+            **Install:**
+            1. Download `remote-pi.apk` below
+            2. Enable "Install from unknown sources" in Settings
+            3. Open the APK and install
+            4. You may see a Play Protect warning — tap **"Install anyway"**
+          files: dist/remote-pi.apk
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
