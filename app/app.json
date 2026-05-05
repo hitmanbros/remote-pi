@@ -1,0 +1,11 @@
+{
+  "expo": {
+    "name": "remote-pi",
+    "slug": "remote-pi",
+    "version": "2.0.0",
+    "platforms": ["android"],
+    "android": {
+      "package": "com.bryan.remotepi"
+    }
+  }
+}

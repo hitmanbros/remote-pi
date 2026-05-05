@@ -1,0 +1,27 @@
+{
+  "name": "remote-pi",
+  "version": "2.0.0",
+  "main": "expo/AppEntry.js",
+  "scripts": {
+    "start": "expo start",
+    "android": "expo run:android",
+    "prebuild:android": "expo prebuild --platform android --clean",
+    "build:android": "expo prebuild --platform android --clean && cd android && ./gradlew assembleRelease"
+  },
+  "dependencies": {
+    "expo": "~52.0.0",
+    "react-native": "0.76.0",
+    "react": "18.3.1",
+    "@react-navigation/native": "^7.0.0",
+    "@react-navigation/native-stack": "^7.0.0",
+    "react-native-screens": "~4.0.0",
+    "react-native-safe-area-context": "~4.12.0",
+    "@react-native-async-storage/async-storage": "1.23.1",
+    "react-native-markdown-display": "^7.0.0"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.25.0",
+    "typescript": "^5.7.0",
+    "@types/react": "~18.3.0"
+  }
+}
