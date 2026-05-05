@@ -14,6 +14,18 @@ export interface SessionInfo {
   cost?: number;
 }
 
+export interface HistoryMessage {
+  entryId: string;
+  role: "user" | "assistant" | "tool" | "system";
+  text: string;
+  thinking?: string;
+  toolName?: string;
+  toolArgs?: string;
+  toolResult?: string;
+  isError?: boolean;
+  timestamp: number;
+}
+
 const SESSIONS_DIR = join(homedir(), ".pi", "agent", "sessions");
 
 export async function listSessions(): Promise<SessionInfo[]> {
@@ -29,6 +41,127 @@ export async function listSessions(): Promise<SessionInfo[]> {
   }
   sessions.sort((a, b) => b.modified - a.modified);
   return sessions;
+}
+
+export async function findSessionFileById(sessionId: string): Promise<string | null> {
+  const files = await findJsonlFiles(SESSIONS_DIR);
+  for (const filePath of files) {
+    try {
+      const fd = await readFile(filePath, "utf8");
+      const firstLine = fd.split("\n")[0];
+      if (!firstLine) continue;
+      const header = JSON.parse(firstLine) as Record<string, unknown>;
+      if (header.type === "session" && header.id === sessionId) {
+        return filePath;
+      }
+    } catch {
+      // skip
+    }
+  }
+  return null;
+}
+
+export async function parseSessionMessages(
+  filePath: string,
+  afterEntryId?: string
+): Promise<{ messages: HistoryMessage[]; lastEntryId: string | null }> {
+  const content = await readFile(filePath, "utf8");
+  const lines = content.split("\n").filter((l) => l.trim());
+  const messages: HistoryMessage[] = [];
+  let lastEntryId: string | null = null;
+  let foundOffset = !afterEntryId;
+
+  for (const line of lines) {
+    try {
+      const entry = JSON.parse(line) as Record<string, unknown>;
+      if (entry.id && typeof entry.id === "string") {
+        lastEntryId = entry.id;
+      }
+      if (!foundOffset) {
+        if (entry.id === afterEntryId) {
+          foundOffset = true;
+        }
+        continue;
+      }
+      const msg = convertEntryToMessage(entry);
+      if (msg) messages.push(msg);
+    } catch {
+      // skip malformed
+    }
+  }
+
+  return { messages, lastEntryId };
+}
+
+function convertEntryToMessage(entry: Record<string, unknown>): HistoryMessage | null {
+  if (entry.type !== "message") return null;
+  const msg = entry.message as Record<string, unknown> | undefined;
+  if (!msg) return null;
+
+  const timestamp =
+    typeof entry.timestamp === "string"
+      ? new Date(entry.timestamp).getTime()
+      : Date.now();
+
+  const role = msg.role as string;
+  const content = msg.content;
+
+  if (role === "user") {
+    return {
+      entryId: String(entry.id ?? ""),
+      role: "user",
+      text: extractText(content),
+      timestamp,
+    };
+  }
+
+  if (role === "assistant") {
+    return {
+      entryId: String(entry.id ?? ""),
+      role: "assistant",
+      text: extractText(content),
+      thinking: extractThinking(content),
+      timestamp,
+    };
+  }
+
+  if (role === "toolResult") {
+    return {
+      entryId: String(entry.id ?? ""),
+      role: "tool",
+      text: extractText(content),
+      toolName: String(msg.toolName ?? ""),
+      toolResult: extractText(content),
+      isError: !!msg.isError,
+      timestamp,
+    };
+  }
+
+  if (role === "custom") {
+    return {
+      entryId: String(entry.id ?? ""),
+      role: "system",
+      text: extractText(content),
+      timestamp,
+    };
+  }
+
+  return null;
+}
+
+function extractText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((c: any) => c?.type === "text")
+    .map((c: any) => c?.text ?? "")
+    .join("");
+}
+
+function extractThinking(content: unknown): string | undefined {
+  if (!Array.isArray(content)) return undefined;
+  const thinking = content.find((c: any) => c?.type === "thinking");
+  return thinking?.thinking;
 }
 
 async function findJsonlFiles(dir: string): Promise<string[]> {

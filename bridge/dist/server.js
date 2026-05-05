@@ -1,10 +1,11 @@
 import { createServer } from "node:http";
 import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
+import { stat } from "node:fs/promises";
 import { WebSocketServer } from "ws";
 import { authenticate } from "./auth.js";
 import { PiProcess } from "./pi-process.js";
-import { listSessions } from "./sessions.js";
+import { listSessions, findSessionFileById, parseSessionMessages } from "./sessions.js";
 import { browseDir } from "./fs-browser.js";
 const PORT = Number(process.env.PORT ?? 8765);
 const CWD = process.env.PI_CWD ?? process.cwd();
@@ -55,10 +56,26 @@ const httpServer = createServer(async (req, res) => {
         }
         return;
     }
+    const messagesMatch = url.pathname.match(/^\/api\/sessions\/([^\/]+)\/messages$/);
+    if (messagesMatch && req.method === "GET") {
+        const sessionId = decodeURIComponent(messagesMatch[1]);
+        try {
+            const filePath = await findSessionFileById(sessionId);
+            if (!filePath) {
+                sendJson(res, 404, { error: "Session not found" });
+                return;
+            }
+            const { messages } = await parseSessionMessages(filePath);
+            sendJson(res, 200, { messages });
+        }
+        catch (err) {
+            sendJson(res, 500, { error: String(err) });
+        }
+        return;
+    }
     if (url.pathname === "/api/fs" && req.method === "GET") {
         const rawPath = url.searchParams.get("path") ?? "/";
         const resolved = resolve(rawPath);
-        // Basic traversal guard: reject paths outside root that contain .. tricks
         if (resolved.includes("\0") || /\.\./.test(rawPath)) {
             sendJson(res, 400, { error: "Invalid path" });
             return;
@@ -88,6 +105,53 @@ const httpServer = createServer(async (req, res) => {
 const wss = new WebSocketServer({ server: httpServer });
 wss.on("connection", (ws) => {
     const state = { ws, pi: null, authenticated: false, initialized: false };
+    function sendToClient(data) {
+        if (ws.readyState === 1) {
+            ws.send(JSON.stringify(data));
+        }
+    }
+    function stopWatcher() {
+        if (state.watcherTimer) {
+            clearInterval(state.watcherTimer);
+            state.watcherTimer = undefined;
+        }
+    }
+    async function startWatcher() {
+        stopWatcher();
+        if (!state.sessionId)
+            return;
+        const filePath = await findSessionFileById(state.sessionId);
+        if (!filePath)
+            return;
+        state.sessionFilePath = filePath;
+        // Load initial state
+        try {
+            const { messages, lastEntryId } = await parseSessionMessages(filePath);
+            state.lastEntryId = lastEntryId ?? undefined;
+        }
+        catch {
+            // ignore
+        }
+        state.watcherTimer = setInterval(async () => {
+            if (!state.sessionFilePath || !state.sessionId)
+                return;
+            try {
+                const st = await stat(state.sessionFilePath);
+                const { messages, lastEntryId } = await parseSessionMessages(state.sessionFilePath, state.lastEntryId);
+                if (messages.length > 0) {
+                    state.lastEntryId = lastEntryId ?? state.lastEntryId;
+                    sendToClient({
+                        type: "history_update",
+                        sessionId: state.sessionId,
+                        messages,
+                    });
+                }
+            }
+            catch {
+                // file may be temporarily unavailable
+            }
+        }, 2000);
+    }
     ws.on("message", (raw) => {
         let data;
         try {
@@ -118,22 +182,24 @@ wss.on("connection", (ws) => {
                 if (state.pi) {
                     state.pi.kill();
                 }
+                stopWatcher();
                 const sessionId = typeof data.sessionId === "string" ? data.sessionId : undefined;
                 const cwd = typeof data.cwd === "string" ? data.cwd : CWD;
+                state.sessionId = sessionId;
+                state.cwd = cwd;
                 state.pi = new PiProcess({
                     sessionId,
                     cwd,
                     onMessage: (msg) => {
-                        if (ws.readyState === 1)
-                            ws.send(JSON.stringify(msg));
+                        sendToClient(msg);
                     },
                     onClose: (code) => {
-                        if (ws.readyState === 1) {
-                            ws.send(JSON.stringify({ type: "pi_exit", code }));
-                        }
+                        sendToClient({ type: "pi_exit", code });
                     },
                 });
                 state.initialized = true;
+                // Start watching the session file for external changes
+                void startWatcher();
                 return;
             }
             ws.send(JSON.stringify({ type: "error", message: "Send init before commands" }));
@@ -147,6 +213,7 @@ wss.on("connection", (ws) => {
         }
     });
     ws.on("close", () => {
+        stopWatcher();
         if (state.pi) {
             state.pi.kill();
             state.pi = null;
@@ -154,6 +221,7 @@ wss.on("connection", (ws) => {
     });
     ws.on("error", (err) => {
         console.error("WS error:", err);
+        stopWatcher();
         if (state.pi) {
             state.pi.kill();
             state.pi = null;

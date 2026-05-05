@@ -3,6 +3,18 @@ import type { ChatMessage, HostConfig, AgentEvent, ExtensionUIRequest, TokenStat
 
 type Listener = () => void;
 
+interface HistoryMessage {
+  entryId: string;
+  role: "user" | "assistant" | "tool" | "system";
+  text: string;
+  thinking?: string;
+  toolName?: string;
+  toolArgs?: string;
+  toolResult?: string;
+  isError?: boolean;
+  timestamp: number;
+}
+
 interface SessionState {
   messages: ChatMessage[];
   isStreaming: boolean;
@@ -60,7 +72,7 @@ class SessionStore {
     return this.sessionId;
   }
 
-  connect(host: HostConfig, sessionId: string, cwd: string): void {
+  async connect(host: HostConfig, sessionId: string, cwd: string): Promise<void> {
     if (
       this.ws &&
       this.host?.serverUrl === host.serverUrl &&
@@ -95,6 +107,49 @@ class SessionStore {
     });
 
     this.ws.connect();
+
+    // Load full history from REST API
+    await this.loadHistory(host, sessionId);
+  }
+
+  private async loadHistory(host: HostConfig, sessionId: string): Promise<void> {
+    try {
+      const baseUrl = host.serverUrl.replace(/^ws/, "http");
+      const res = await fetch(`${baseUrl}/api/sessions/${encodeURIComponent(sessionId)}/messages`, {
+        headers: { Authorization: `Bearer ${host.token}` },
+      });
+      if (!res.ok) return;
+      const data = await res.json() as { messages?: HistoryMessage[] };
+      if (!data.messages) return;
+
+      const converted = data.messages.map((m) => this.historyToChat(m));
+      this.setState(sessionId, (s) => ({
+        ...s,
+        messages: this.mergeMessages(s.messages, converted),
+      }));
+    } catch {
+      // ignore fetch errors
+    }
+  }
+
+  private historyToChat(h: HistoryMessage): ChatMessage {
+    return {
+      id: h.entryId,
+      role: h.role,
+      text: h.text,
+      thinking: h.thinking,
+      toolName: h.toolName,
+      toolArgs: h.toolArgs,
+      toolResult: h.toolResult,
+      isError: h.isError,
+      createdAt: h.timestamp,
+    };
+  }
+
+  private mergeMessages(existing: ChatMessage[], incoming: ChatMessage[]): ChatMessage[] {
+    const seen = new Set(existing.map((m) => m.id));
+    const newOnes = incoming.filter((m) => !seen.has(m.id));
+    return [...existing, ...newOnes];
   }
 
   disconnect(): void {
@@ -143,7 +198,6 @@ class SessionStore {
 
   extensionUIResponse(id: string, response?: Record<string, unknown>): void {
     this.ws?.extensionUIResponse(id, response);
-    // Clear extUI after responding
     if (this.sessionId) {
       this.setState(this.sessionId, (s) => ({ ...s, extUI: null }));
     }
@@ -181,6 +235,19 @@ class SessionStore {
   private handleEvent(event: AgentEvent): void {
     const sid = this.sessionId;
     if (!sid) return;
+
+    // Handle history updates from file watcher (PC changes)
+    if (event.type === "history_update") {
+      const messages = (event as Record<string, unknown>).messages as HistoryMessage[] | undefined;
+      if (messages && messages.length > 0) {
+        const converted = messages.map((m) => this.historyToChat(m));
+        this.setState(sid, (s) => ({
+          ...s,
+          messages: this.mergeMessages(s.messages, converted),
+        }));
+      }
+      return;
+    }
 
     switch (event.type) {
       case "message_start": {
