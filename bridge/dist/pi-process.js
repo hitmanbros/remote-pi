@@ -16,10 +16,7 @@ export class PiProcess {
         else {
             args.push("-c");
         }
-        if (options.cwd) {
-            args.push("--cwd", options.cwd);
-        }
-        this.proc = spawn("pi", args, { stdio: ["pipe", "pipe", "pipe"] });
+        this.proc = spawn("pi", args, { stdio: ["pipe", "pipe", "pipe"], cwd: options.cwd || process.cwd() });
         this.proc.stdout.setEncoding("utf8");
         this.proc.stdout.on("data", (chunk) => this.handleStdout(chunk));
         this.proc.stderr.on("data", (chunk) => {

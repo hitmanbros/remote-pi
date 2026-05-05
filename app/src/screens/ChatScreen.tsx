@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 import {
   View,
   Text,
@@ -13,14 +13,8 @@ import {
 } from "react-native";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 import type { RootStackParamList } from "../../App";
-import { PiWebSocket } from "../services/websocket";
-import type {
-  ChatMessage,
-  AgentEvent,
-  ExtensionUIRequest,
-  HostConfig,
-  TokenStats,
-} from "../types";
+import { sessionStore } from "../services/session-store";
+import type { ChatMessage, HostConfig } from "../types";
 import { MarkdownRenderer } from "../components/MarkdownRenderer";
 import { ThinkingBlock } from "../components/ThinkingBlock";
 import { ToolCard } from "../components/ToolCard";
@@ -32,78 +26,48 @@ type Props = NativeStackScreenProps<RootStackParamList, "Chat"> & {
   isDark: boolean;
 };
 
-function genId() {
-  return Math.random().toString(36).slice(2) + Date.now().toString(36);
-}
-
-function extractResultText(result: unknown): string {
-  if (typeof result === "string") return result;
-  if (Array.isArray(result)) {
-    return result
-      .map((c) =>
-        typeof c === "string" ? c : (c as Record<string, unknown>)?.text ?? JSON.stringify(c)
-      )
-      .filter(Boolean)
-      .join("\n");
-  }
-  if (result && typeof result === "object") {
-    const content = (result as Record<string, unknown>).content;
-    if (Array.isArray(content)) {
-      return content
-        .map((c: Record<string, unknown>) => c.text)
-        .filter(Boolean)
-        .join("\n");
-    }
-    return JSON.stringify(result, null, 2);
-  }
-  return String(result ?? "");
-}
-
 export function ChatScreen({ navigation, route, activeHost, isDark }: Props) {
   const { sessionId, cwd } = route.params;
 
-  const ws = useMemo(() => {
-    if (!activeHost) return null;
-    return new PiWebSocket({
-      serverUrl: activeHost.serverUrl,
-      token: activeHost.token,
-      sessionId,
-      cwd,
+  const [, forceUpdate] = useState(0);
+  const [input, setInput] = useState("");
+  const flatListRef = useRef<FlatList<ChatMessage>>(null);
+
+  const state = sessionStore.getAllState(sessionId);
+  const { messages, isStreaming, pendingCount, connected, tokenStats, extUI } = state;
+
+  // Connect to session store on mount; store persists across navigation
+  useEffect(() => {
+    if (activeHost) {
+      sessionStore.connect(activeHost, sessionId, cwd);
+    }
+    const unsub = sessionStore.onChange(() => {
+      forceUpdate((n) => n + 1);
+      // Auto-scroll when messages update
+      setTimeout(() => {
+        flatListRef.current?.scrollToEnd({ animated: true });
+      }, 50);
     });
+    return () => {
+      unsub();
+      // Note: we intentionally do NOT disconnect here.
+      // The store keeps the WS alive so history survives navigation.
+    };
   }, [activeHost, sessionId, cwd]);
 
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [input, setInput] = useState("");
-  const [isStreaming, setIsStreaming] = useState(false);
-  const [pendingCount, setPendingCount] = useState(0);
-  const [connected, setConnected] = useState(false);
-  const [extUI, setExtUI] = useState<ExtensionUIRequest | null>(null);
-  const [tokenStats, setTokenStats] = useState<{
-    tokens?: TokenStats;
-    cost?: number;
-  } | null>(null);
-
-  const flatListRef = useRef<FlatList<ChatMessage>>(null);
-  const assistantIdRef = useRef<string | null>(null);
-  const pendingToolIdRef = useRef<string | null>(null);
-
-  // Connect / disconnect
+  // Handle notify-style extension UI requests (fire-and-forget Alert)
   useEffect(() => {
-    if (!ws) return;
-    ws.connect();
-    const unsubConn = ws.onConnectionChange((c) => setConnected(c));
-    return () => {
-      unsubConn();
-      ws.disconnect();
-    };
-  }, [ws]);
-
-  // Poll session stats
-  useEffect(() => {
-    if (!ws || !connected) return;
-    const id = setInterval(() => ws.getSessionStats(), 10000);
-    return () => clearInterval(id);
-  }, [ws, connected]);
+    if (extUI?.method === "notify") {
+      Alert.alert(extUI.title ?? "Notification", extUI.message ?? "", [
+        {
+          text: "OK",
+          onPress: () => {
+            sessionStore.extensionUIResponse(extUI.id, {});
+          },
+        },
+      ]);
+    }
+  }, [extUI]);
 
   // Header
   useEffect(() => {
@@ -156,222 +120,16 @@ export function ChatScreen({ navigation, route, activeHost, isDark }: Props) {
     });
   }, [navigation, connected, pendingCount, isDark, activeHost]);
 
-  // WebSocket events
-  useEffect(() => {
-    if (!ws) return;
-    const unsub = ws.onEvent((event: AgentEvent) => {
-      switch (event.type) {
-        case "message_start": {
-          const id = genId();
-          assistantIdRef.current = id;
-          const msg: ChatMessage = {
-            id,
-            role: "assistant",
-            text: "",
-            pending: true,
-            createdAt: Date.now(),
-          };
-          setMessages((prev) => [...prev, msg]);
-          break;
-        }
-        case "message_update": {
-          const ame = (event as Record<string, unknown>)
-            .assistantMessageEvent as Record<string, unknown> | undefined;
-          if (!ame) return;
-          const id = assistantIdRef.current;
-          if (!id) return;
-          if (ame.type === "text_delta") {
-            const delta = ame.delta as string;
-            setMessages((prev) =>
-              prev.map((m) =>
-                m.id === id ? { ...m, text: m.text + delta } : m
-              )
-            );
-          }
-          if (ame.type === "thinking_delta") {
-            const delta = ame.delta as string;
-            setMessages((prev) =>
-              prev.map((m) =>
-                m.id === id
-                  ? { ...m, thinking: (m.thinking ?? "") + delta }
-                  : m
-              )
-            );
-          }
-          break;
-        }
-        case "message_end": {
-          const id = assistantIdRef.current;
-          if (!id) return;
-          setMessages((prev) =>
-            prev.map((m) => (m.id === id ? { ...m, pending: false } : m))
-          );
-          assistantIdRef.current = null;
-          break;
-        }
-        case "agent_start":
-          setIsStreaming(true);
-          break;
-        case "agent_end":
-          setIsStreaming(false);
-          ws.getSessionStats();
-          break;
-        case "tool_execution_start": {
-          const toolName = (event as Record<string, unknown>).toolName as
-            | string
-            | undefined;
-          const args = (event as Record<string, unknown>).args;
-          const id = genId();
-          pendingToolIdRef.current = id;
-          const msg: ChatMessage = {
-            id,
-            role: "tool",
-            text: "",
-            toolName: toolName ?? "tool",
-            toolArgs: args ? JSON.stringify(args, null, 2) : undefined,
-            pending: true,
-            createdAt: Date.now(),
-          };
-          setMessages((prev) => [...prev, msg]);
-          break;
-        }
-        case "tool_execution_update": {
-          const result = (event as Record<string, unknown>).result;
-          const id = pendingToolIdRef.current;
-          if (!id) return;
-          const text = extractResultText(result);
-          setMessages((prev) =>
-            prev.map((m) =>
-              m.id === id
-                ? { ...m, toolResult: (m.toolResult ?? "") + text }
-                : m
-            )
-          );
-          break;
-        }
-        case "tool_execution_end": {
-          const toolName = (event as Record<string, unknown>).toolName as
-            | string
-            | undefined;
-          const result = (event as Record<string, unknown>).result;
-          const isError = (event as Record<string, unknown>).isError as
-            | boolean
-            | undefined;
-          const id = pendingToolIdRef.current;
-          if (id) {
-            const text = extractResultText(result);
-            setMessages((prev) =>
-              prev.map((m) =>
-                m.id === id
-                  ? {
-                      ...m,
-                      toolName: toolName ?? m.toolName,
-                      toolResult: text || m.toolResult,
-                      isError: !!isError,
-                      pending: false,
-                    }
-                  : m
-              )
-            );
-            pendingToolIdRef.current = null;
-          }
-          break;
-        }
-        case "queue_update": {
-          const steering = (event as Record<string, unknown>).steering as
-            | string[]
-            | undefined;
-          const followUp = (event as Record<string, unknown>).followUp as
-            | string[]
-            | undefined;
-          const count =
-            (steering?.length ?? 0) + (followUp?.length ?? 0);
-          setPendingCount(count);
-          break;
-        }
-        case "extension_ui_request": {
-          const req = event as unknown as ExtensionUIRequest;
-          if (req.method === "notify") {
-            Alert.alert(
-              req.title ?? "Notification",
-              req.message ?? "",
-              [
-                {
-                  text: "OK",
-                  onPress: () => ws.extensionUIResponse(req.id, {}),
-                },
-              ]
-            );
-          } else {
-            setExtUI(req);
-          }
-          break;
-        }
-        case "system": {
-          const text = (event as Record<string, unknown>).text as
-            | string
-            | undefined;
-          if (text) {
-            const msg: ChatMessage = {
-              id: genId(),
-              role: "system",
-              text,
-              createdAt: Date.now(),
-            };
-            setMessages((prev) => [...prev, msg]);
-          }
-          break;
-        }
-        case "response": {
-          const tokens = (event as Record<string, unknown>).tokens as
-            | TokenStats
-            | undefined;
-          const cost = (event as Record<string, unknown>).cost as
-            | number
-            | undefined;
-          if (tokens || cost !== undefined) {
-            setTokenStats({ tokens, cost });
-          }
-          break;
-        }
-        default:
-          break;
-      }
-    });
-    return unsub;
-  }, [ws]);
-
   const handleSend = useCallback(() => {
     const text = input.trim();
-    if (!text || !ws) return;
+    if (!text || !activeHost) return;
     setInput("");
-
-    if (text === "/new") {
-      ws.newSession();
-      const msg: ChatMessage = {
-        id: genId(),
-        role: "system",
-        text: "Started new session.",
-        createdAt: Date.now(),
-      };
-      setMessages((prev) => [...prev, msg]);
-      return;
-    }
-
-    ws.prompt(text);
-    const msg: ChatMessage = {
-      id: genId(),
-      role: "user",
-      text,
-      createdAt: Date.now(),
-    };
-    setMessages((prev) => [...prev, msg]);
-  }, [input, ws]);
+    sessionStore.sendPrompt(text);
+  }, [input, activeHost]);
 
   const handleAbort = useCallback(() => {
-    ws?.abort();
-    setIsStreaming(false);
-  }, [ws]);
+    sessionStore.abort();
+  }, []);
 
   const scrollToEnd = useCallback(() => {
     flatListRef.current?.scrollToEnd({ animated: true });
@@ -524,13 +282,13 @@ export function ChatScreen({ navigation, route, activeHost, isDark }: Props) {
         ) : (
           <TouchableOpacity
             onPress={handleSend}
-            disabled={!input.trim() || !ws}
+            disabled={!input.trim() || !connected}
             style={styles.sendBtn}
           >
             <Text
               style={{
                 color:
-                  input.trim() && ws
+                  input.trim() && connected
                     ? isDark
                       ? "#0a84ff"
                       : "#007aff"
@@ -548,9 +306,13 @@ export function ChatScreen({ navigation, route, activeHost, isDark }: Props) {
       </View>
 
       <ExtensionUIModal
-        request={extUI}
-        onClose={() => setExtUI(null)}
-        ws={ws!}
+        request={extUI?.method === "notify" ? null : extUI}
+        onClose={() => {
+          if (extUI) {
+            sessionStore.extensionUIResponse(extUI.id, { cancelled: true });
+          }
+        }}
+        ws={sessionStore.getWebSocket()}
         isDark={isDark}
       />
     </KeyboardAvoidingView>

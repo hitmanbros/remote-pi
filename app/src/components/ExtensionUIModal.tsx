@@ -15,7 +15,7 @@ import type { ExtensionUIRequest } from "../types";
 interface Props {
   request: ExtensionUIRequest | null;
   onClose: () => void;
-  ws: PiWebSocket;
+  ws: PiWebSocket | null;
   isDark: boolean;
 }
 
@@ -27,7 +27,7 @@ export function ExtensionUIModal({ request, onClose, ws, isDark }: Props) {
     request !== null && !silentMethods.includes(request.method ?? "");
 
   useEffect(() => {
-    if (request?.method === "notify") {
+    if (request?.method === "notify" && ws) {
       Alert.alert(request.title ?? "Notification", request.message ?? "", [
         {
           text: "OK",
@@ -51,12 +51,12 @@ export function ExtensionUIModal({ request, onClose, ws, isDark }: Props) {
   if (!request || !visible || request.method === "notify") return null;
 
   const handleConfirm = (response?: Record<string, unknown>) => {
-    ws.extensionUIResponse(request.id, response);
+    ws?.extensionUIResponse(request.id, response);
     onClose();
   };
 
   const handleCancel = () => {
-    ws.extensionUIResponse(request.id, { cancelled: true });
+    ws?.extensionUIResponse(request.id, { cancelled: true });
     onClose();
   };
 
