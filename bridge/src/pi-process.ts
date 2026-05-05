@@ -30,9 +30,6 @@ export class PiProcess {
     } else {
       args.push("-c");
     }
-    if (options.cwd) {
-      args.push("--cwd", options.cwd);
-    }
 
     this.proc = spawn("pi", args, { stdio: ["pipe", "pipe", "pipe"], cwd: options.cwd || process.cwd() });
     this.proc.stdout.setEncoding("utf8");
